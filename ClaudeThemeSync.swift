@@ -1,17 +1,35 @@
 import Foundation
 
-class ClaudeThemeSync {
-    private let configPath: String
+// Sync the macOS light/dark appearance into Claude Code's theme, live.
+//
+// Claude Code watches `<configDir>/themes/*.json` and hot-reloads a running
+// session when one changes (see the official terminal-config docs). We use that
+// as the live channel: we keep a custom theme file named "AutoSync" in every
+// config root and flip only its `base` between "dark" and "light" when the OS
+// switches. A running Claude Code session set to the "AutoSync" theme repaints
+// without a restart (the repaint lands as soon as the agent goes idle).
+//
+// The name is deliberately NOT "auto" — Claude Code ships a built-in `auto`
+// theme (startup-only OSC detection), so a custom "auto" would collide with it.
+//
+// This is different from writing the `theme` key in `~/.claude.json`, which
+// Claude Code reads only at startup and never live-reloads.
 
-    init() {
-        self.configPath = NSString(string: "~/.claude.json").expandingTildeInPath
-    }
+class ClaudeThemeSync {
+    // Every config root to keep in sync. The default lives in ~/.claude; the
+    // `claude-personal` alias points CLAUDE_CONFIG_DIR at ~/.claude-personal.
+    // Only roots that already exist are touched — we never create a stray
+    // config directory.
+    private let configRoots: [String] = [
+        NSString(string: "~/.claude").expandingTildeInPath,
+        NSString(string: "~/.claude-personal").expandingTildeInPath,
+    ]
 
     func start() {
-        // Sync immediately on start
-        syncTheme()
+        setvbuf(stdout, nil, _IONBF, 0) // unbuffered so the launchd log is live
 
-        // Listen for theme changes
+        syncTheme() // sync immediately on start
+
         DistributedNotificationCenter.default().addObserver(
             self,
             selector: #selector(handleThemeChange),
@@ -19,71 +37,95 @@ class ClaudeThemeSync {
             object: nil
         )
 
-        print("Claude Theme Sync started. Listening for theme changes...")
-
-        // Keep running
-        RunLoop.current.run()
+        log("Claude Theme Sync started. Listening for appearance changes…")
+        RunLoop.current.run() // keep running
     }
 
     @objc private func handleThemeChange() {
-        print("Theme change detected")
+        log("Appearance change detected")
         syncTheme()
     }
 
     private func syncTheme() {
-        let isDarkMode = isDarkModeEnabled()
-        let theme = isDarkMode ? "dark" : "light"
+        let base = isDarkModeEnabled() ? "dark" : "light"
+        log("System is \(base) — updating AutoSync theme")
 
-        print("Setting Claude Code theme to: \(theme)")
-
-        if updateConfig(theme: theme) {
-            print("Successfully updated ~/.claude.json")
-        } else {
-            print("Failed to update ~/.claude.json")
+        for root in configRoots where directoryExists(root) {
+            let themesDir = root + "/themes"
+            let themePath = themesDir + "/autosync.json"
+            if writeAutoTheme(base: base, themesDir: themesDir, themePath: themePath) {
+                log("  ✓ \(themePath)")
+            } else {
+                log("  ✗ failed: \(themePath)")
+            }
         }
     }
 
+    // Read AppleInterfaceStyle straight from the global-domain prefs, forcing a
+    // resync first — UserDefaults.standard caches and can return the *old* value
+    // in the notification handler. In Light mode the key is absent, not "Light".
     private func isDarkModeEnabled() -> Bool {
-        return UserDefaults.standard.string(forKey: "AppleInterfaceStyle") == "Dark"
+        CFPreferencesAppSynchronize(kCFPreferencesAnyApplication)
+        let style = CFPreferencesCopyAppValue(
+            "AppleInterfaceStyle" as CFString,
+            kCFPreferencesAnyApplication
+        ) as? String
+        return style == "Dark"
     }
 
-    private func updateConfig(theme: String) -> Bool {
-        let fileManager = FileManager.default
+    private func directoryExists(_ path: String) -> Bool {
+        var isDir: ObjCBool = false
+        return FileManager.default.fileExists(atPath: path, isDirectory: &isDir) && isDir.boolValue
+    }
 
-        // Read existing config
-        guard fileManager.fileExists(atPath: configPath),
-              let data = fileManager.contents(atPath: configPath),
-              var json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            print("Error: Could not read ~/.claude.json")
-            return false
-        }
+    // Update only `base`, preserving any `name`/`overrides` the user has set.
+    // Creates the themes dir and a fresh Auto theme if absent.
+    private func writeAutoTheme(base: String, themesDir: String, themePath: String) -> Bool {
+        let fm = FileManager.default
 
-        // Check if theme is already correct
-        if let currentTheme = json["theme"] as? String, currentTheme == theme {
-            print("Theme already set to \(theme), skipping update")
-            return true
-        }
-
-        // Update theme
-        json["theme"] = theme
-
-        // Write back with pretty printing to preserve readability
-        guard let updatedData = try? JSONSerialization.data(
-            withJSONObject: json,
-            options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-        ) else {
-            print("Error: Could not serialize JSON")
-            return false
-        }
-
-        // Write atomically to prevent corruption
         do {
-            try updatedData.write(to: URL(fileURLWithPath: configPath), options: .atomic)
+            try fm.createDirectory(atPath: themesDir, withIntermediateDirectories: true)
+        } catch {
+            log("  ! could not create \(themesDir): \(error)")
+            return false
+        }
+
+        var theme: [String: Any] = ["name": "AutoSync", "overrides": [String: Any]()]
+        if let data = fm.contents(atPath: themePath),
+           let existing = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            theme = existing
+            if theme["name"] == nil { theme["name"] = "AutoSync" }
+            if theme["overrides"] == nil { theme["overrides"] = [String: Any]() }
+        }
+
+        if let current = theme["base"] as? String, current == base,
+           fm.fileExists(atPath: themePath) {
+            return true // already correct — avoid a redundant write / watcher churn
+        }
+        theme["base"] = base
+
+        guard let out = try? JSONSerialization.data(
+            withJSONObject: theme,
+            options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        ) else { return false }
+
+        do {
+            try out.write(to: URL(fileURLWithPath: themePath), options: .atomic)
             return true
         } catch {
-            print("Error writing config: \(error)")
+            log("  ! write error: \(error)")
             return false
         }
+    }
+
+    private let stamp: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime]
+        return f
+    }()
+
+    private func log(_ message: String) {
+        print("[\(stamp.string(from: Date()))] \(message)")
     }
 }
 
