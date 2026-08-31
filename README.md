@@ -23,8 +23,9 @@ That's it! The daemon is now running and will start automatically on login.
 ## How It Works
 
 1. A lightweight Swift daemon listens to macOS appearance-change notifications.
-2. On a change it writes a custom theme file, `<config>/themes/autosync.json`, flipping only its `base` between `dark` and `light`.
-3. Claude Code watches its `themes/` folder and hot-reloads, so any running session set to the **AutoSync** theme repaints without a restart.
+2. A change arms a short settle timer rather than writing straight away, so a burst of notifications produces one write of the value that is actually current.
+3. It writes a custom theme file, `<config>/themes/autosync.json`, flipping only its `base` between `dark` and `light`.
+4. Claude Code watches its `themes/` folder and hot-reloads, so any running session set to the **AutoSync** theme repaints without a restart.
 
 > The theme is named **AutoSync**, not `auto` — Claude Code has a built-in `auto` theme (startup-only detection); a custom `auto` would collide with it.
 
@@ -69,6 +70,10 @@ The live-reload channel is Claude Code's custom-theme watcher, not the `theme` k
 ```
 
 On `AppleInterfaceThemeChangedNotification` it rewrites only `base` (preserving any `name`/`overrides` you've added). Dark/light is read from the global-domain `AppleInterfaceStyle` pref via `CFPreferences` (forced resync each time, since `UserDefaults` caches and can report the old value in the notification handler).
+
+**Waking the Mac is the case that needs care.** With appearance set to switch automatically, the OS flips while the machine is asleep — and the first `AppleInterfaceStyle` read after wake hands back the *pre-sleep* value, with the true one arriving on a second notification about a second later. Writing both in turn publishes a wrong theme and then corrects it, and Claude Code's watcher takes the first write and coalesces away the second, leaving the session on the pre-sleep theme until you toggle appearance by hand.
+
+So a notification never writes directly. It arms a two-second settle timer that each further notification re-arms, and only the value still standing after the burst is written. A single re-read five seconds later catches a wake slow enough to outlast even that, and a sixty-second poll compares the file against the system as a backstop for a change that posts no notification we see at all. Both of those write only on a genuine mismatch, so neither churns the watcher.
 
 **Caveat:** a repaint lands when the agent is idle — Claude Code doesn't switch theme mid-generation ([#30690](https://github.com/anthropics/claude-code/issues/30690)).
 

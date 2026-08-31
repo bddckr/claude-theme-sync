@@ -14,6 +14,16 @@ import Foundation
 //
 // This is different from writing the `theme` key in `~/.claude.json`, which
 // Claude Code reads only at startup and never live-reloads.
+//
+// Waking the Mac is the case that needs care. With appearance set to switch
+// automatically the OS flips while the machine is asleep, and the *first*
+// AppleInterfaceStyle read after wake comes back stale — the pre-sleep value —
+// with the true one arriving on a second notification about a second later.
+// Writing both in turn publishes a wrong theme and then corrects it, and Claude
+// Code's watcher takes the first write and coalesces away the second, so the
+// session sits on the pre-sleep theme until you toggle appearance by hand. That
+// is why a notification never writes directly: it arms a settle timer, and only
+// the value still standing after the burst is written.
 
 class ClaudeThemeSync {
     // Every config root to keep in sync. The default lives in ~/.claude; the
@@ -25,10 +35,28 @@ class ClaudeThemeSync {
         NSString(string: "~/.claude-personal").expandingTildeInPath,
     ]
 
+    // A notification arms this, and each further one re-arms it; only the value
+    // standing after this much quiet is written. Long enough to outlast the
+    // stale post-wake read, short enough that a manual toggle still feels live.
+    private let settleDelay: TimeInterval = 2
+
+    // One re-read after the settled write, for a wake slow enough that even the
+    // settle window closed on the stale value.
+    private let verifyDelay: TimeInterval = 5
+
+    // Backstop for a change that posts no notification we see at all. Costs one
+    // pref read, and writes only on a genuine mismatch, so it never churns the
+    // watcher — it just means no missed notification can strand a session.
+    private let pollInterval: TimeInterval = 60
+
+    private var settleTimer: Timer?
+    private var verifyTimer: Timer?
+    private var pollTimer: Timer?
+
     func start() {
         setvbuf(stdout, nil, _IONBF, 0) // unbuffered so the launchd log is live
 
-        syncTheme() // sync immediately on start
+        syncTheme(reason: "start", evenIfUnchanged: true)
 
         DistributedNotificationCenter.default().addObserver(
             self,
@@ -37,33 +65,65 @@ class ClaudeThemeSync {
             object: nil
         )
 
+        pollTimer = Timer.scheduledTimer(withTimeInterval: pollInterval, repeats: true) { [weak self] _ in
+            self?.syncTheme(reason: "poll")
+        }
+        pollTimer?.tolerance = pollInterval / 4 // let the OS coalesce our wakeups
+
         log("Claude Theme Sync started. Listening for appearance changes…")
         RunLoop.current.run() // keep running
     }
 
+    // Never syncs inline — see the wake note above. Re-arming on each
+    // notification collapses a burst into the one write that is actually right.
     @objc private func handleThemeChange() {
-        log("Appearance change detected")
-        syncTheme()
+        log("Appearance change detected — settling for \(Int(settleDelay))s")
+        settleTimer?.invalidate()
+        settleTimer = Timer.scheduledTimer(withTimeInterval: settleDelay, repeats: false) { [weak self] _ in
+            guard let self else { return }
+            self.syncTheme(reason: "settled")
+            self.verifyTimer?.invalidate()
+            self.verifyTimer = Timer.scheduledTimer(withTimeInterval: self.verifyDelay, repeats: false) { [weak self] _ in
+                self?.syncTheme(reason: "verify")
+            }
+        }
     }
 
-    private func syncTheme() {
-        let base = isDarkModeEnabled() ? "dark" : "light"
-        log("System is \(base) — updating AutoSync theme")
+    private enum WriteResult {
+        case wrote
+        case unchanged
+        case failed
+    }
 
+    // Quiet when there was nothing to do, so the poll doesn't fill the log with
+    // a line a minute. `evenIfUnchanged` is for the one-off startup line, which
+    // is worth having as proof the daemon read the appearance at all.
+    private func syncTheme(reason: String, evenIfUnchanged: Bool = false) {
+        let base = isDarkModeEnabled() ? "dark" : "light"
+
+        var lines: [String] = []
         for root in configRoots where directoryExists(root) {
             let themesDir = root + "/themes"
             let themePath = themesDir + "/autosync.json"
-            if writeAutoTheme(base: base, themesDir: themesDir, themePath: themePath) {
-                log("  ✓ \(themePath)")
-            } else {
-                log("  ✗ failed: \(themePath)")
+            switch writeAutoTheme(base: base, themesDir: themesDir, themePath: themePath) {
+            case .wrote: lines.append("  ✓ wrote \(themePath)")
+            case .unchanged: break
+            case .failed: lines.append("  ✗ failed: \(themePath)")
             }
         }
+
+        guard !lines.isEmpty || evenIfUnchanged else { return }
+        log("System is \(base) (\(reason))" + (lines.isEmpty ? " — already in sync" : " — updating AutoSync theme"))
+        for line in lines { log(line) }
     }
 
     // Read AppleInterfaceStyle straight from the global-domain prefs, forcing a
     // resync first — UserDefaults.standard caches and can return the *old* value
     // in the notification handler. In Light mode the key is absent, not "Light".
+    //
+    // The resync is not enough on its own across a wake: the first read after
+    // one can still hand back the pre-sleep value, which is what the settle
+    // timer in handleThemeChange() exists to ride out.
     private func isDarkModeEnabled() -> Bool {
         CFPreferencesAppSynchronize(kCFPreferencesAnyApplication)
         let style = CFPreferencesCopyAppValue(
@@ -79,15 +139,15 @@ class ClaudeThemeSync {
     }
 
     // Update only `base`, preserving any `name`/`overrides` the user has set.
-    // Creates the themes dir and a fresh Auto theme if absent.
-    private func writeAutoTheme(base: String, themesDir: String, themePath: String) -> Bool {
+    // Creates the themes dir and a fresh AutoSync theme if absent.
+    private func writeAutoTheme(base: String, themesDir: String, themePath: String) -> WriteResult {
         let fm = FileManager.default
 
         do {
             try fm.createDirectory(atPath: themesDir, withIntermediateDirectories: true)
         } catch {
             log("  ! could not create \(themesDir): \(error)")
-            return false
+            return .failed
         }
 
         var theme: [String: Any] = ["name": "AutoSync", "overrides": [String: Any]()]
@@ -98,23 +158,23 @@ class ClaudeThemeSync {
             if theme["overrides"] == nil { theme["overrides"] = [String: Any]() }
         }
 
-        if let current = theme["base"] as? String, current == base,
-           fm.fileExists(atPath: themePath) {
-            return true // already correct — avoid a redundant write / watcher churn
-        }
+        // A `base` key can only have come from an existing, parsed file, so this
+        // covers "file already correct" — leave it alone rather than touch it
+        // and make the watcher repaint for nothing.
+        if let current = theme["base"] as? String, current == base { return .unchanged }
         theme["base"] = base
 
         guard let out = try? JSONSerialization.data(
             withJSONObject: theme,
             options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-        ) else { return false }
+        ) else { return .failed }
 
         do {
             try out.write(to: URL(fileURLWithPath: themePath), options: .atomic)
-            return true
+            return .wrote
         } catch {
             log("  ! write error: \(error)")
-            return false
+            return .failed
         }
     }
 
