@@ -73,7 +73,11 @@ On `AppleInterfaceThemeChangedNotification` it rewrites only `base` (preserving 
 
 **Waking the Mac is the case that needs care.** With appearance set to switch automatically, the OS flips while the machine is asleep — and the first `AppleInterfaceStyle` read after wake hands back the *pre-sleep* value, with the true one arriving on a second notification about a second later. Writing both in turn publishes a wrong theme and then corrects it, and Claude Code's watcher takes the first write and coalesces away the second, leaving the session on the pre-sleep theme until you toggle appearance by hand.
 
-So a notification never writes directly. It arms a two-second settle timer that each further notification re-arms, and only the value still standing after the burst is written. A single re-read five seconds later catches a wake slow enough to outlast even that, and a sixty-second poll compares the file against the system as a backstop for a change that posts no notification we see at all. Both of those write only on a genuine mismatch, so neither churns the watcher.
+So a notification never writes directly. It arms a settle timer that each further notification re-arms, and only the value still standing after the burst is written.
+
+That settle is **a quarter-second for an ordinary toggle** — there is no stale read to ride out when you flip appearance by hand, and a visible pause there is just lag — and **three seconds just after a wake**, which is the only moment the long wait buys anything. A wake is spotted by the divergence between the wall clock and uptime (uptime excludes time asleep; the wall clock doesn't), so it needs no power-management API or AppKit dependency, and the slow settle applies for thirty seconds afterwards to cover the whole burst.
+
+A single re-read five seconds later catches a wake slow enough to outlast even that, and a sixty-second poll compares the file against the system as a backstop for a change that posts no notification we see at all. Both write only on a genuine mismatch, so neither churns the watcher.
 
 **Caveat:** a repaint lands when the agent is idle — Claude Code doesn't switch theme mid-generation ([#30690](https://github.com/anthropics/claude-code/issues/30690)).
 

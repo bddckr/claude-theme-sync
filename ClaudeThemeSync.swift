@@ -24,6 +24,12 @@ import Foundation
 // session sits on the pre-sleep theme until you toggle appearance by hand. That
 // is why a notification never writes directly: it arms a settle timer, and only
 // the value still standing after the burst is written.
+//
+// That wait is only warranted just after a wake, though — a manual toggle has
+// no stale read to ride out, and a visible pause there is just lag. So we spot
+// a wake by the divergence between the wall clock and uptime, and spend the
+// long settle only inside that window; every other change settles in a quarter
+// of a second.
 
 class ClaudeThemeSync {
     // Every config root to keep in sync. The default lives in ~/.claude; the
@@ -36,9 +42,24 @@ class ClaudeThemeSync {
     ]
 
     // A notification arms this, and each further one re-arms it; only the value
-    // standing after this much quiet is written. Long enough to outlast the
-    // stale post-wake read, short enough that a manual toggle still feels live.
-    private let settleDelay: TimeInterval = 2
+    // standing after this much quiet is written. A manual toggle wants this as
+    // close to nothing as it can get — here it exists only to collapse a
+    // same-instant burst, and a quarter-second is not perceptible.
+    private let settleDelay: TimeInterval = 0.25
+
+    // Waking is the exception. The stale read and its correction land about a
+    // second apart, so the settle has to outlast that or we publish the wrong
+    // theme first and Claude Code latches onto it. Nobody is watching the
+    // screen the instant a lid opens, so the longer wait costs nothing here.
+    private let wakeSettleDelay: TimeInterval = 3
+
+    // How long after a wake to keep using the slow settle — long enough to
+    // cover the whole burst, since only its first notification sees the jump.
+    private let wakeGrace: TimeInterval = 30
+
+    // Wall-clock/uptime divergence above this means we genuinely slept, rather
+    // than were merely descheduled for a moment.
+    private let sleepThreshold: TimeInterval = 5
 
     // One re-read after the settled write, for a wake slow enough that even the
     // settle window closed on the stale value.
@@ -53,8 +74,18 @@ class ClaudeThemeSync {
     private var verifyTimer: Timer?
     private var pollTimer: Timer?
 
+    // Set when either the notification or the poll notices the machine slept;
+    // until it passes, a notification uses the slow settle.
+    private var wakeDeadline = Date.distantPast
+    private var launchDate = Date()
+    private var launchUptime: TimeInterval = 0
+    private var lastSlept: TimeInterval = 0
+
     func start() {
         setvbuf(stdout, nil, _IONBF, 0) // unbuffered so the launchd log is live
+
+        launchDate = Date()
+        launchUptime = uptime()
 
         syncTheme(reason: "start", evenIfUnchanged: true)
 
@@ -66,7 +97,9 @@ class ClaudeThemeSync {
         )
 
         pollTimer = Timer.scheduledTimer(withTimeInterval: pollInterval, repeats: true) { [weak self] _ in
-            self?.syncTheme(reason: "poll")
+            guard let self else { return }
+            self.noteSleepIfAny() // so a wake that posts no notification still slows the next one
+            self.syncTheme(reason: "poll")
         }
         pollTimer?.tolerance = pollInterval / 4 // let the OS coalesce our wakeups
 
@@ -77,9 +110,11 @@ class ClaudeThemeSync {
     // Never syncs inline — see the wake note above. Re-arming on each
     // notification collapses a burst into the one write that is actually right.
     @objc private func handleThemeChange() {
-        log("Appearance change detected — settling for \(Int(settleDelay))s")
+        noteSleepIfAny()
+        let delay = Date() < wakeDeadline ? wakeSettleDelay : settleDelay
+        log("Appearance change detected — settling for \(String(format: "%g", delay))s")
         settleTimer?.invalidate()
-        settleTimer = Timer.scheduledTimer(withTimeInterval: settleDelay, repeats: false) { [weak self] _ in
+        settleTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
             guard let self else { return }
             self.syncTheme(reason: "settled")
             self.verifyTimer?.invalidate()
@@ -115,6 +150,25 @@ class ClaudeThemeSync {
         guard !lines.isEmpty || evenIfUnchanged else { return }
         log("System is \(base) (\(reason))" + (lines.isEmpty ? " — already in sync" : " — updating AutoSync theme"))
         for line in lines { log(line) }
+    }
+
+    // Seconds since boot, which on Darwin excludes time the machine spent
+    // asleep. The wall clock doesn't, so the two diverge by exactly how long we
+    // were out — no power-management API or AppKit dependency needed.
+    private func uptime() -> TimeInterval {
+        var ts = timespec()
+        clock_gettime(CLOCK_UPTIME_RAW, &ts)
+        return TimeInterval(ts.tv_sec) + TimeInterval(ts.tv_nsec) / 1_000_000_000
+    }
+
+    // Cheap enough to call on every notification — two clock reads compared
+    // against where they stood when we last looked, and no timer of its own.
+    private func noteSleepIfAny() {
+        let slept = Date().timeIntervalSince(launchDate) - (uptime() - launchUptime)
+        defer { lastSlept = slept }
+        guard slept - lastSlept > sleepThreshold else { return }
+        wakeDeadline = Date().addingTimeInterval(wakeGrace)
+        log("Woke after \(Int(slept - lastSlept))s asleep — settling slowly for \(Int(wakeGrace))s")
     }
 
     // Read AppleInterfaceStyle straight from the global-domain prefs, forcing a
